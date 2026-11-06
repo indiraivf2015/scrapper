@@ -122,6 +122,29 @@ def _is_question(text: str) -> bool:
     return text.endswith("?") or bool(_QUESTION_START.match(text))
 
 
+_SOCIAL = frozenset({"instagram", "facebook", "youtube"})
+# A question sentence inside a caption or title: "...Both are fertility... IVF vs egg freezing: what's the difference?"
+_QUESTION_SENTENCE = re.compile(r"[^.!?\n•|]{8,220}\?")
+_TRIM = " \"'“”‘’-–—:·…"
+_LEAD_IN = re.compile(r"^(?:(?:many|most|some|people|patients|couples|you|they|everyone|often)\s+)*"
+                      r"(?:ask|asks|asked|wonder|question|q|faq)\s*:\s*", re.I)
+
+
+def _question_text(r: Record) -> str:
+    """The question a record asks. Social posts often carry it mid-title or in the caption, not as the title."""
+    if r.record_type == "comment":
+        return r.content_snippet or ""
+    title = r.title or ""
+    if r.record_type in {"people_also_ask", "question"} or _is_question(title) or r.platform not in _SOCIAL:
+        return title
+    for text in (title, r.content_snippet or ""):
+        for m in _QUESTION_SENTENCE.finditer(text):
+            candidate = _LEAD_IN.sub("", m.group(0).strip(_TRIM)).strip(_TRIM)
+            if len(candidate.split()) >= 3:
+                return candidate[0].upper() + candidate[1:]
+    return title
+
+
 def _answers(r: Record) -> int | None:
     """How many replies the question already has, when the platform tells us."""
     m = r.metrics or {}
@@ -182,7 +205,7 @@ def open_queries(records: list[Record], top_n: int = 40) -> list[dict[str, Any]]
     seen: set[str] = set()
     out = []
     for r in records:
-        text = (r.content_snippet if r.record_type == "comment" else r.title) or ""
+        text = _question_text(r)
         if not (r.record_type in {"people_also_ask", "question"} or _is_question(text)):
             continue
         key = re.sub(r"\W+", " ", text.casefold()).strip()[:140]

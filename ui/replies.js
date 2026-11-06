@@ -22,12 +22,12 @@ export function initReplies() {
 export function showReplies() { load(); }
 
 /** From an open query: add it to the queue (with any answers we have as context) and open the queue. */
-export async function addToReplyQueue(q) {
+export async function addToReplyQueue(q, reply = null) {
   const context = [...(q.answers || []), ...(q.manual_answers || [])].map((a) => a.text).filter(Boolean).slice(0, 10);
   const res = await fetch("/api/replies", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ question: q.question, platform: q.platform, record_type: q.record_type || "question",
-      source_url: q.source_url, graph_id: q.graph_id || null, context }),
+      source_url: q.source_url, graph_id: q.graph_id || null, context, reply }),
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(describeError(data.detail) || `HTTP ${res.status}`);

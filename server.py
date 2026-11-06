@@ -39,6 +39,7 @@ from market_scraper.regional_research import regional_brief
 from market_scraper.trends import TrendsError, google_trends
 from market_scraper.scriptgen import ScriptGenError, generate_content
 from market_scraper.manual_answers import MAX_ANSWER_CHARS, MAX_ANSWERS_PER_QUESTION, ManualAnswers
+from market_scraper.answer_writer import AiAnswers, answers_for
 from market_scraper.publishers import capabilities
 from market_scraper.replies import ReplyError, ReplyQueue, draft_reply
 from market_scraper.store import SearchStore
@@ -47,6 +48,7 @@ UI_DIR = Path(__file__).parent / "ui"
 DATA_DIR = Path(__file__).parent / "data" / "searches"
 MANUAL_ANSWERS_FILE = Path(__file__).parent / "data" / "manual_answers.json"
 REPLIES_FILE = Path(__file__).parent / "data" / "replies.json"
+AI_ANSWERS_FILE = Path(__file__).parent / "data" / "ai_answers.json"
 _HASHTAG = re.compile(r"^[0-9A-Za-z_]{1,100}$")
 _HTTP_URL = r"^https?://"
 _LOOPBACK = {"127.0.0.1", "localhost", "::1"}
@@ -213,6 +215,20 @@ class ReplyAddBody(BaseModel):
     source_url: str = Field(min_length=1, max_length=2000, pattern=_HTTP_URL)
     graph_id: str | None = Field(None, max_length=64, pattern=r"^[0-9_]+$")
     context: list[str] = Field(default_factory=list, max_length=10)
+    reply: str | None = Field(None, max_length=3000)  # start from a written answer (disclosure line added)
+
+
+class OpenAnswerItem(BaseModel):
+    question: str = Field(min_length=1, max_length=300)
+    source_url: str = Field(min_length=1, max_length=2000, pattern=_HTTP_URL)
+    platform: str = Field(max_length=20)
+    context: list[str] = Field(default_factory=list, max_length=5)
+
+
+class OpenAnswersBody(BaseModel):
+    items: list[OpenAnswerItem] = Field(min_length=1, max_length=30)
+    generate: bool = False  # False: only return cached answers (no Claude call)
+    refresh: bool = False  # True: rewrite even the cached ones
 
 
 class ReplyEditBody(BaseModel):
@@ -252,7 +268,8 @@ class ExportBody(BaseModel):
 
 def create_app(settings: Settings, *, transport: httpx.AsyncBaseTransport | None = None,
                allowed_hosts: list[str] | None = None, store_dir: Path | None = None,
-               manual_answers_file: Path | None = None, replies_file: Path | None = None) -> FastAPI:
+               manual_answers_file: Path | None = None, replies_file: Path | None = None,
+               ai_answers_file: Path | None = None) -> FastAPI:
     app = FastAPI(title="Market Scraper", docs_url=None, redoc_url=None, openapi_url=None)
     hosts = allowed_hosts or ["127.0.0.1", "localhost", "[::1]", "testserver"]
     # Blocks DNS-rebinding: a malicious site can't drive this server through the browser.
@@ -261,6 +278,8 @@ def create_app(settings: Settings, *, transport: httpx.AsyncBaseTransport | None
     store = SearchStore(store_dir)  # no directory (tests) = in memory only
     manual = ManualAnswers(manual_answers_file)  # no file (tests) = in memory only
     replies = ReplyQueue(settings, replies_file)  # no file (tests) = in memory only
+    ai_answers = AiAnswers(ai_answers_file)  # no file (tests) = in memory only
+    writing = asyncio.Semaphore(1)  # one batch of Claude answers at a time
 
     @app.middleware("http")
     async def same_origin_writes(request: Request, call_next):
@@ -274,12 +293,16 @@ def create_app(settings: Settings, *, transport: httpx.AsyncBaseTransport | None
     def with_manual_answers(payload: dict) -> dict:
         for q in payload.get("insights", {}).get("open_queries", []):
             q["manual_answers"] = manual.get(q.get("answer_key", ""))
+            q["ai_answer"] = ai_answers.get(q.get("answer_key", ""))
         return payload
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
         response: Response = await call_next(request)
         response.headers.update(SECURITY_HEADERS)
+        if request.url.path == "/" or request.url.path.startswith("/static/"):
+            # Revalidate on every load (cheap 304 via ETag) so an update never runs against stale JS.
+            response.headers["Cache-Control"] = "no-cache"
         return response
 
     @app.get("/", include_in_schema=False)
@@ -473,6 +496,20 @@ def create_app(settings: Settings, *, transport: httpx.AsyncBaseTransport | None
     async def save_manual_answers(body: ManualAnswersBody) -> dict:
         return manual.set(body.source_url, body.question, body.answers)
 
+    @app.post("/api/open-answers")
+    async def open_answers(body: OpenAnswersBody) -> dict:
+        """Claude-written answers for open queries, keyed by answer_key. generate=False only reads the cache."""
+        items = [i.model_dump() for i in body.items]
+        try:
+            if body.generate:
+                async with writing:
+                    found = await answers_for(settings, ai_answers, items, generate=True, refresh=body.refresh)
+            else:
+                found = await answers_for(settings, ai_answers, items, generate=False)
+        except ScriptGenError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return {"answers": found, "writer": bool(settings.anthropic_api_key)}
+
     # ------------------------------------------------------------ reply queue (ORM)
 
     def reply_call(fn, *args):
@@ -491,7 +528,8 @@ def create_app(settings: Settings, *, transport: httpx.AsyncBaseTransport | None
     @app.post("/api/replies")
     async def add_reply(body: ReplyAddBody) -> dict:
         return replies.add(question=body.question, platform=body.platform, record_type=body.record_type,
-                           source_url=body.source_url, graph_id=body.graph_id, context=body.context)
+                           source_url=body.source_url, graph_id=body.graph_id, context=body.context,
+                           reply=body.reply)
 
     @app.post("/api/replies/{item_id}/draft")
     async def draft_reply_route(item_id: str) -> dict:
@@ -557,7 +595,8 @@ def main() -> None:
     if args.open:
         webbrowser.open(url)
     uvicorn.run(create_app(Settings.from_env(args.env_file), allowed_hosts=allowed, store_dir=DATA_DIR,
-                           manual_answers_file=MANUAL_ANSWERS_FILE, replies_file=REPLIES_FILE),
+                           manual_answers_file=MANUAL_ANSWERS_FILE, replies_file=REPLIES_FILE,
+                           ai_answers_file=AI_ANSWERS_FILE),
                 host=args.host, port=args.port, log_level="warning")
 
 

@@ -228,6 +228,15 @@ class HttpClient:
         assert last_error is not None
         raise last_error
 
+    async def reachable(self, url: str, timeout: float = 6.0) -> bool:
+        """One quick attempt, no retries: can we open a connection to this host at all?
+        Any HTTP answer (even 4xx) counts; only network failures (blocked, timeout, DNS) return False."""
+        try:
+            await self._client(None).get(url, timeout=timeout, headers={"User-Agent": API_USER_AGENT})
+            return True
+        except httpx.TransportError:
+            return False
+
     async def get_json(self, url: str, **kwargs: Any) -> Any:
         return await self.json("GET", url, **kwargs)
 

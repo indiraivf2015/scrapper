@@ -186,7 +186,7 @@ function showReport(payload) {
   renderQuestions(payload.insights?.audience_questions || []);
   renderPainPoints(payload.insights?.pain_points || []);
   renderOpenQueries(payload.insights?.open_queries || []);
-  refreshManualAnswers(payload);
+  refreshManualAnswers(payload).then(() => writeAnswers(payload));
   renderBreakdown(payload.insights?.platform_breakdown || {});
   renderResults();
   try {
@@ -270,6 +270,20 @@ function answersPanel(q, open) {
       el("button", { type: "button", class: "btn btn-ghost btn-sm",
         onclick: () => saveManualAnswers(q, manual.filter((_, j) => j !== i).map((m) => m.text), status) }, "Remove")])));
 
+  let written = null;
+  if (q.ai_answer?.answer) {
+    const useBtn = el("button", { type: "button", class: "btn btn-primary btn-sm", onclick: async () => {
+      status.textContent = "Adding…";
+      try { await addToReplyQueue(q, q.ai_answer.answer); } catch (err) { status.textContent = `Couldn't add: ${err.message}`; }
+    } }, "Use as reply");
+    const flags = q.ai_answer.nmc_flags || [];
+    written = el("div", { class: "answer ai-answer" },
+      el("div", { class: "answer-meta muted" }, "Written by Claude · review before posting"),
+      el("p", { class: "answer-text" }, q.ai_answer.answer),
+      flags.length ? el("p", { class: "notice error" }, `NMC check: ${flags.map((f) => `"${f.match}" (${f.issue})`).join("; ")}. Edit before use.`) : null,
+      el("div", { class: "answer-actions" }, copyButton(q.ai_answer.answer), useBtn));
+  }
+
   let notice = null;
   if (!fetched.length) {
     notice = el("p", { class: "muted hint" }, q.record_type === "comment"
@@ -289,9 +303,12 @@ function answersPanel(q, open) {
   } }, "Add to reply queue");
 
   const total = fetched.length + manual.length;
+  let summary = "Answers: none yet, add one";
+  if (written) summary = total ? `Written answer + ${total} more` : "Written answer & options";
+  else if (total) summary = `Answers (${total})`;
   return el("details", { class: "answers-panel", open: open || null },
-    el("summary", {}, total ? `Answers (${total})` : "Answers: none yet, add one"),
-    total ? list : null, notice,
+    el("summary", {}, summary),
+    written, total ? list : null, notice,
     el("div", { class: "answer-form" }, box,
       el("div", { class: "answer-actions" }, save, link(q.source_url, "Open question ↗"), copyAll, queue, status)));
 }
@@ -302,14 +319,71 @@ function renderOpenQueries(items, openKey = null) {
     const read = (q.answers || []).length;
     const pasted = (q.manual_answers || []).length;
     const counts = [read ? `${read} shown` : null, pasted ? `${pasted} pasted` : null].filter(Boolean).join(" · ");
+    let answerCell;
+    if (q.ai_answer?.answer) {
+      answerCell = el("div", {}, el("p", { class: "oq-answer" }, q.ai_answer.answer),
+        el("div", { class: "muted hint" }, ["Written by Claude", q.existing_answers != null ? `${q.existing_answers} on the site` : null, counts]
+          .filter(Boolean).join(" · ")));
+    } else {
+      answerCell = el("div", {}, oq.writing ? el("span", { class: "muted hint" }, "Writing…") : (q.existing_answers ?? "–"),
+        counts ? el("div", { class: "muted hint" }, counts) : null);
+    }
     return el("tr", {},
       el("td", { class: "oq-question" }, link(q.source_url, q.question), answersPanel(q, openKey && q.answer_key === openKey)),
       el("td", { class: "nowrap" }, dot(q.platform), " ", label(q.platform)),
-      el("td", {}, q.existing_answers ?? "–", counts ? el("div", { class: "muted hint" }, counts) : null),
+      el("td", { class: "oq-answer-cell" }, answerCell),
       el("td", {}, q.why_open), el("td", {}, q.opportunity));
   });
   $("open-queries").replaceChildren(head, el("tbody", {}, ...(rows.length ? rows
     : [el("tr", {}, el("td", { colspan: 5, class: "none" }, "No open questions found in these results."))])));
+}
+
+const oq = { writing: false };
+
+function oqStatus(text, isError = false) {
+  let box = $("oq-status");
+  if (!box) {
+    box = el("div", { id: "oq-status", class: "oq-status" });
+    $("open-queries").closest(".table-wrap").before(box);
+  }
+  const rewrite = el("button", { type: "button", class: "btn btn-ghost btn-sm",
+    onclick: () => writeAnswers(state.payload, { refresh: true }) }, "Rewrite all answers");
+  box.replaceChildren(el("span", { class: `hint ${isError ? "error-text" : "muted"}` }, text),
+    oq.writing || !state.payload?.insights?.open_queries?.length ? null : rewrite);
+}
+
+/** Fill the Answers column: cached answers first, then Claude writes the missing ones in one batch. */
+async function writeAnswers(payload, { refresh = false } = {}) {
+  const items = (payload.insights?.open_queries || []).slice(0, 30);
+  if (!items.length || oq.writing) return;
+  const body = (generate) => JSON.stringify({ generate, refresh, items: items.map((q) => ({
+    question: q.question, source_url: q.source_url, platform: q.platform,
+    context: [...(q.answers || []), ...(q.manual_answers || [])].map((a) => a.text).slice(0, 5) })) });
+  const merge = (answers) => items.forEach((q) => { if (answers[q.answer_key]) q.ai_answer = answers[q.answer_key]; });
+  const post = async (generate) => {
+    const res = await fetch("/api/open-answers", { method: "POST", headers: { "Content-Type": "application/json" }, body: body(generate) });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(describeError(data.detail) || `HTTP ${res.status}`);
+    return data;
+  };
+  try {
+    const cached = await post(false);
+    merge(cached.answers || {});
+    const missing = refresh || items.some((q) => !q.ai_answer);
+    if (!missing) { oqStatus("Answers written by Claude: review each one before you post it anywhere."); return; }
+    if (!cached.writer) { oqStatus("Add ANTHROPIC_API_KEY to .env to have Claude write an answer for every question."); return; }
+    oq.writing = true;
+    oqStatus(`Claude is writing answers for ${items.length} questions… (about a minute)`);
+    if (state.payload === payload) renderOpenQueries(payload.insights.open_queries);
+    const fresh = await post(true);
+    merge(fresh.answers || {});
+    oq.writing = false;
+    oqStatus("Answers written by Claude: review each one before you post it anywhere.");
+  } catch (err) {
+    oq.writing = false;
+    oqStatus(`Couldn't write answers: ${err.message}`, true);
+  }
+  if (state.payload === payload) renderOpenQueries(payload.insights.open_queries);
 }
 
 /** Results opened from a file (or older runs) pick up the latest pasted answers from the server. */
@@ -339,10 +413,11 @@ function exportOpenQueries() {
     ...q,
     answers: (q.answers || []).map((a) => a.text).join("\n---\n"),
     pasted_answers: (q.manual_answers || []).map((a) => a.text).join("\n---\n"),
+    written_answer: q.ai_answer?.answer || "",
   }));
   download(`${fileStem()}-open-queries.csv`, "text/csv;charset=utf-8",
     toCsv(rows, ["question", "platform", "record_type", "existing_answers", "why_open", "opportunity", "engagement_score",
-      "published_at", "source_url", "answers", "pasted_answers"]));
+      "published_at", "source_url", "written_answer", "answers", "pasted_answers"]));
 }
 
 function renderSummary(p) {

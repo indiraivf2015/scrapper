@@ -181,18 +181,23 @@ class ReplyQueue:
     # -------------------------------------------------- writes
 
     def add(self, *, question: str, platform: str, record_type: str, source_url: str,
-            graph_id: str | None = None, context: list[str] | None = None) -> dict[str, Any]:
+            graph_id: str | None = None, context: list[str] | None = None,
+            reply: str | None = None) -> dict[str, Any]:
         key = answer_key(source_url, question)
+        start = self._with_disclosure(reply) if reply and reply.strip() else ""
         with self._lock:
             existing = next((i for i in self._items.values() if i["key"] == key), None)
             if existing:
+                if start and not existing.get("reply") and existing["status"] == "draft":
+                    existing["reply"] = start
+                    self._log(existing, "started from the written answer")
                 return self._view(existing)
             now = utc_now_iso()
             item = {"id": uuid.uuid4().hex, "key": key, "created_at": now, "updated_at": now,
                     "question": question[:300], "platform": platform, "record_type": record_type,
                     "source_url": source_url, "graph_id": graph_id,
                     "context": [c[:2000] for c in (context or []) if c][:5],
-                    "reply": "", "status": "draft", "compliance": None, "approved_by": None, "approved_at": None,
+                    "reply": start, "status": "draft", "compliance": None, "approved_by": None, "approved_at": None,
                     "approved_hash": None, "posted_at": None, "posted_url": None, "posted_by": None,
                     "post_method": None, "error": None, "log": [{"at": now, "event": "added"}]}
             self._items[item["id"]] = item
@@ -279,6 +284,13 @@ class ReplyQueue:
                         post_method="api", error=None)
             self._log(item, f"posted via {target.platform} API", by=by, detail=url)
             return self._view(item)
+
+    def _with_disclosure(self, text: str) -> str:
+        text = text.strip()[:MAX_REPLY_CHARS - 80]
+        brand = self.settings.brand_name
+        if brand and disclosure_ok(text, brand):
+            return text
+        return f"{text}\n\n- {brand or '[INSTITUTION NAME]'} team (official account)"
 
     # -------------------------------------------------- rules
 
