@@ -146,3 +146,23 @@ def test_other_websites_cannot_drive_the_queue(make_client):
     assert evil.status_code == 403
     same = client.put(f"/api/replies/{rid}", json={"reply": GOOD}, headers={"Origin": "http://testserver"})
     assert same.status_code == 200
+
+
+def test_behind_nginx_the_public_site_can_write_but_other_sites_cannot():
+    from fastapi.testclient import TestClient
+    from server import create_app
+
+    client = TestClient(create_app(POSTABLE, allowed_hosts=["127.0.0.1", "localhost", "seo.example.com"]),
+                        base_url="https://seo.example.com")
+    rid = add(client)["id"]
+    ok = client.put(f"/api/replies/{rid}", json={"reply": GOOD}, headers={"Origin": "https://seo.example.com"})
+    assert ok.status_code == 200
+    evil = client.put(f"/api/replies/{rid}", json={"reply": "x"}, headers={"Origin": "https://evil.example.com"})
+    assert evil.status_code == 403
+
+    open_server = TestClient(create_app(POSTABLE, allowed_hosts=["*"]), base_url="http://10.0.0.5:8000")
+    rid = add(open_server)["id"]
+    assert open_server.put(f"/api/replies/{rid}", json={"reply": GOOD},
+                           headers={"Origin": "http://10.0.0.5:8000"}).status_code == 200
+    assert open_server.put(f"/api/replies/{rid}", json={"reply": "x"},
+                           headers={"Origin": "https://evil.example.com"}).status_code == 403, '"*" trusts no origin'

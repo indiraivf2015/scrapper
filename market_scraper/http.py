@@ -209,8 +209,10 @@ class HttpClient:
             else:
                 if response.status_code < 400:
                     return response
-                error = FetchError(f"HTTP {response.status_code} from {host}", status=response.status_code,
-                                   url=url, body=response.text[:500])
+                message = f"HTTP {response.status_code} from {host}"
+                if "Zscaler" in response.text[:20000]:
+                    message += " (blocked by your company's network filter - ask IT to allow this site)"
+                error = FetchError(message, status=response.status_code, url=url, body=response.text[:500])
                 if response.status_code not in retryable:
                     raise error
                 if response.status_code in (403, 429):

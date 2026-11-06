@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import re
 import webbrowser
 from pathlib import Path
@@ -286,8 +287,13 @@ def create_app(settings: Settings, *, transport: httpx.AsyncBaseTransport | None
         """Another website open in the browser must never be able to post replies through this server."""
         if request.method not in ("GET", "HEAD", "OPTIONS"):
             origin = request.headers.get("origin")
-            if origin and (urlsplit(origin).hostname or "") not in {h.strip("[]") for h in hosts}:
-                return JSONResponse({"detail": "Cross-origin request refused."}, status_code=403)
+            if origin:
+                origin_host = (urlsplit(origin).hostname or "").lower()
+                own_host = (urlsplit(f"//{request.headers.get('host', '')}").hostname or "").lower()
+                # Same site (incl. the public name behind nginx) or a listed host; "*" never counts here.
+                trusted = {h.strip("[]").lower() for h in hosts if h != "*"} | {own_host}
+                if origin_host not in trusted:
+                    return JSONResponse({"detail": "Cross-origin request refused."}, status_code=403)
         return await call_next(request)
 
     def with_manual_answers(payload: dict) -> dict:
@@ -585,6 +591,10 @@ def main() -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)  # httpx logs full URLs incl. API keys
 
     allowed = None
+    # Behind a reverse proxy (nginx) the app binds to 127.0.0.1 but receives the public Host header.
+    extra_hosts = [h.strip() for h in os.getenv("ALLOWED_HOSTS", "").split(",") if h.strip()]
+    if extra_hosts:
+        allowed = ["127.0.0.1", "localhost", "[::1]", *extra_hosts]
     if args.host not in _LOOPBACK:
         logging.warning("Listening on %s with no authentication. Anyone on this network can use your API keys.",
                         args.host)
